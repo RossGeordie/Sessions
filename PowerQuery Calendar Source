@@ -1,11 +1,12 @@
 let
-    
     // ONLY EDIT THESE VALUES
     StartDate = #date(2000, 1, 1),  // Update the date you want your calendar table to start here the format is yyyy, mm, dd
-    EndDate = #date(2024, 12, 31),  // Update the date you want your calendar table to start here the format is yyyy, mm, dd
+    EndDateYearOffset = 1, //Set Offset to 0 to use the HardEndDate below 
+    HardEndDate = #date(2024, 12, 31),  // Update the date you want your calendar table to start here the format is yyyy, mm, dd
     CorpMonthStart = 8,             // Month number for corporate Calendar
     SoW = 0,                        // First Day of Week - 0 - 6 0 = Sunday, 1 = Monday, 2 =  Tuesday...
     // END OF CONFIGURATION
+    EndDate = if EndDateYearOffset <> 0 then #date(Date.Year(DateTime.Date(DateTime.LocalNow()))+EndDateYearOffset, 12, 31) else HardEndDate,
     CurrentDate = DateTime.Date(DateTime.LocalNow()),
     CorpMonthEnd = CorpMonthStart - 1,
     CorpDiff = 12 - CorpMonthStart + 1,
@@ -26,6 +27,7 @@ let
     AddCorporateMonth = Table.AddColumn(AddDayofWeek, "CorpMonthnum", each if Date.Month([Date]) >= CorpMonthStart then Date.Month([Date]) - CorpMonthEnd else Date.Month([Date]) + CorpDiff, Int64.Type),
     AddWeekNumber = Table.AddColumn(AddCorporateMonth, "Week Number", each Date.WeekOfYear(Date.AddDays([Date], 7 - Date.DayOfWeek([Date], SoW))), Int64.Type),
     #"Added Custom" = Table.AddColumn(AddWeekNumber, "CorpYear", each if [Month] > CorpMonthEnd then "FY-" & Text.From([Year]) else "FY-" & Text.From([Year]-1)),
-    #"Changed Type" = Table.TransformColumnTypes(#"Added Custom",{{"Date", type date}, {"Year", type text}, {"Month", Int64.Type}, {"Day", Int64.Type}, {"Month Name", type text}, {"Day Name", type text}, {"Formatted Date", type text}, {"MonthYear", type text}, {"Day Offset", Int64.Type}, {"CorpYear", type text}})
+    AddWeekOffset = Table.AddColumn(#"Added Custom", "Week Offset", each Number.RoundDown(Duration.Days(Date.StartOfWeek([Date], SoW) - Date.StartOfWeek(CurrentDate, SoW)) / 7), Int64.Type),
+    #"Changed Type" = Table.TransformColumnTypes(AddWeekOffset,{{"Date", type date}, {"Year", type text}, {"Month", Int64.Type}, {"Day", Int64.Type}, {"Month Name", type text}, {"Day Name", type text}, {"Formatted Date", type text}, {"MonthYear", type text}, {"Day Offset", Int64.Type}, {"CorpYear", type text}})
 in
     #"Changed Type"
