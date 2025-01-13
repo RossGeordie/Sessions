@@ -1,0 +1,25 @@
+Consecutive Volunteers = 
+VAR _event = [Event]
+    VAR summT0_ = [ParkrunID]
+    VAR summT_ = CALCULATETABLE(VALUES(Volunteers[Event]), Volunteers[URL] = _event && Volunteers[VolunteerID] = summT0_)
+	VAR auxT_ =
+        FILTER (
+            ADDCOLUMNS (
+                summT_,
+                "index_",
+                    COUNTROWS ( FILTER ( summT_,Volunteers[Event] <= EARLIER ( Volunteers[Event] ) ) ) 
+            ),
+            VAR nextDate_ =
+                MINX ( FILTER ( summT_, Volunteers[Event] > EARLIER ( Volunteers[Event] ) ), Volunteers[Event] )
+            RETURN
+                 ( nextDate_ - Volunteers[Event] ) <> 1
+        )
+    VAR res_ =
+        MAXX ( 
+            auxT_,
+            [index_]
+                - MAXX ( FILTER ( auxT_, [index_] < EARLIER ( [index_] ) ), [index_] )
+        )
+    
+    RETURN
+    res_

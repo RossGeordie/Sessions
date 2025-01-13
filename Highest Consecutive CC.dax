@@ -1,0 +1,25 @@
+Highest Consecutive = 
+	VAR _event = [Event]
+    VAR summT0_ = [ParkrunID]
+    VAR summT_ = CALCULATETABLE(VALUES(Participation[parkrunNumber]), Participation[URL] = _event && Participation[ParkrunID] = summT0_)
+	VAR auxT_ =
+        FILTER (
+            ADDCOLUMNS (
+                summT_,
+                "index_",
+                    COUNTROWS ( FILTER ( summT_, Participation[parkrunNumber] <= EARLIER ( Participation[parkrunNumber] ) ) ) 
+            ),
+            VAR nextDate_ =
+                MINX ( FILTER ( summT_, Participation[parkrunNumber] > EARLIER ( Participation[parkrunNumber] ) ), Participation[parkrunNumber] )
+            RETURN
+                 ( nextDate_ - Participation[parkrunNumber] ) <> 1
+        )
+    VAR res_ =
+        MAXX ( 
+            auxT_,
+            [index_]
+                - MAXX ( FILTER ( auxT_, [index_] < EARLIER ( [index_] ) ), [index_] )
+        )
+    
+    RETURN
+    res_
