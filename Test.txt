@@ -1,81 +1,20 @@
-// Ensures specified optional fields exist in every record inside a nested table column.
-// Missing fields are added as null, so expansion won't error.
-// Usage:
-//   Fixed = FixNestedOptionalFields(Source, "Incidents", {"id","name","created_at"}, {"price","assignee","priority"});
-//   // Then expand "Incidents" with the union of required+optional fields.
-
 let
-    FixNestedOptionalFields = (
-        inputTable as table,
-        columnName as text,
-        requiredFields as list,
-        optionalFields as list
-    ) as table =>
-    let
-        // Lower-case optional/required for consistent casing
-        req = List.Transform(requiredFields, Text.Lower),
-        opt = List.Transform(optionalFields, Text.Lower),
+    Source = PreviousStep,   // your table with column "Incidents"
 
-        // 1) Guard against error/non-table cells in the nested column
-        Guarded =
-            Table.TransformColumns(
-                inputTable,
-                {
-                    columnName,
-                    each
-                        let v = try _ otherwise #table({}, {})
-                        in
-                            if Value.Is(v, type table) then v else #table({}, {})
-                }
-            ),
+    // Convert each nested table to a record (first row if only one record per incident)
+    AsRecord = Table.AddColumn(
+        Source,
+        "IncidentRecord",
+        each if Table.IsEmpty([Incidents]) 
+             then null 
+             else Record.FromTable([Incidents]{0})
+    ),
 
-        // 2) Normalize casing inside each nested table and add missing optional fields to every record
-        NormalizeOneTable = (t as table) as table =>
-            let
-                Lowered   = Table.TransformColumnNames(t, Text.Lower),
-                AsRecords = Table.ToRecords(Lowered),
-                PatchedRecords =
-                    List.Transform(
-                        AsRecords,
-                        (r) =>
-                            List.Accumulate(
-                                opt,
-                                r,
-                                (state, fld) =>
-                                    if Record.HasFields(state, {fld}) then state
-                                    else Record.AddField(state, fld, null)
-                            )
-                    ),
-                BackToTable = Table.FromRecords(PatchedRecords)
-            in
-                BackToTable,
+    // Safely extract fields
+    WithId    = Table.AddColumn(AsRecord, "id",    each Record.FieldOrDefault([IncidentRecord], "id", null)),
+    WithName  = Table.AddColumn(WithId,    "name",  each Record.FieldOrDefault([IncidentRecord], "name", null)),
+    WithPrice = Table.AddColumn(WithName,  "price", each Record.FieldOrDefault([IncidentRecord], "price", null)),
 
-        Normalized =
-            Table.TransformColumns(
-                Guarded,
-                { columnName, NormalizeOneTable }
-            ),
-
-        // 3) Safe expansion: all required + optional fields now exist in every record
-        ExpandFields = List.Distinct(req & opt),
-        Expanded = Table.ExpandTableColumn(Normalized, columnName, ExpandFields)
-    in
-        Expanded
+    Result = Table.RemoveColumns(WithPrice, {"Incidents","IncidentRecord"})
 in
-    FixNestedOptionalFields
-
-
-
-// Main
-
-let
-    // Your table with a single column "Incidents" (each cell is a nested table of incident records)
-    Source = PreviousStep,
-
-    // Choose fields (make price optional)
-    Required = {"id","name","created_at","updated_at","state"},
-    Optional = {"price","assignee","priority"},
-
-    Fixed = FixNestedOptionalFields(Source, "Incidents", Required, Optional)
-in
-    Fixed
+    Result
