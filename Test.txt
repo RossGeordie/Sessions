@@ -1,0 +1,45 @@
+// Drop-in function to normalize and expand a column of tables
+// Usage: NormalizeAndExpand(Source, "Incidents")
+
+let
+    NormalizeAndExpand = (inputTable as table, columnName as text) =>
+    let
+        // Step 1: make sure every nested table has consistent column casing
+        Lowered = Table.TransformColumns(inputTable, {columnName, each Table.TransformColumnNames(_, Text.Lower)}),
+
+        // Step 2: discover all possible columns across all nested tables
+        AllColumns =
+            let
+                namesPerTable = List.Transform(Lowered[columnName], each Table.ColumnNames(_)),
+                flattened     = List.Combine(namesPerTable),
+                distinctLower = List.Distinct(flattened)
+            in
+                distinctLower,
+
+        // Step 3: align each nested table to include all discovered columns
+        AlignSchema = (t as table) as table =>
+            let
+                withAll =
+                    List.Accumulate(
+                        AllColumns,
+                        t,
+                        (state, col) =>
+                            if List.Contains(Table.ColumnNames(state), col) then state
+                            else Table.AddColumn(state, col, each null)
+                    ),
+                reordered = Table.ReorderColumns(withAll, AllColumns, MissingField.Ignore)
+            in
+                reordered,
+
+        Normalised = Table.TransformColumns(Lowered, {columnName, AlignSchema}),
+
+        // Step 4: expand safely
+        Expanded = Table.ExpandTableColumn(Normalised, columnName, AllColumns)
+    in
+        Expanded
+in
+    NormalizeAndExpand
+
+
+
+Expanded = NormalizeAndExpand(Source, "Incidents")
