@@ -1,58 +1,80 @@
+//1
+
 let
-    // Replace PreviousStep with the step that has your column "Incidents"
     Source = PreviousStep,
+    N = 100,                      // pick sample size (100 safe)
+    Sample = Table.FirstN(Source, N),
 
-    // Fields you want to keep (exclude "price")
-    WantedFields = {"id","name","created_at","updated_at","state","assignee"}, // edit to your needed fields
+    // helper to safely get a value type text
+    GetTypeText = (v) =>
+        let t = try Value.Type(v) otherwise null
+        in if t = null then "error/null" else Type.ToText(t),
 
-    // Option: lower-case protection for vendor casing drift
-    LowerFlag = true,
-    Wanted = if LowerFlag then List.Transform(WantedFields, Text.Lower) else WantedFields,
-
-    // Helper: safe get field from record
-    SafeGet = (r as record, f as text) => try Record.FieldOrDefault(r, f, null) otherwise null,
-
-    // Helper: convert any nested value into a list of records
-    ValueToRecords = (v as any) as list =>
-        let
-            safe = try v otherwise null
+    // helper: does nested value contain a 'price' field (case-insensitive)
+    HasPrice = (v) =>
+        let safe = try v otherwise null
         in
-            if safe = null then
-                {}
-            else if Value.Is(safe, type table) then
-                let t = if LowerFlag then Table.TransformColumnNames(safe, Text.Lower) else safe
-                in Table.ToRecords(t)
-            else if Value.Is(safe, type record) then
-                { if LowerFlag then Record.TransformFields(safe, List.Transform(Record.FieldNames(safe), each {_, (x)=>x, type any}), MissingField.Ignore) else safe }
+            if safe = null then false
+            else if Value.Is(safe, type table) then List.Contains(List.Transform(Table.ColumnNames(safe), Text.Lower), "price")
+            else if Value.Is(safe, type record) then List.Contains(List.Transform(Record.FieldNames(safe), Text.Lower), "price")
             else if Value.Is(safe, type list) then
                 let isRecList = List.Count(safe) > 0 and List.AllTrue(List.Transform(safe, each Value.Is(_, type record)))
-                in if isRecList then safe else {}
-            else
-                {},
+                in if isRecList then List.Contains(List.Transform(Record.FieldNames(List.First(safe)), Text.Lower), "price") else false
+            else false,
 
-    // Walk each outer row, turn nested value into records and project only Wanted fields
-    Rows = Table.ToRecords(Source),
-    PerRowProjected =
-        List.Transform(
-            Rows,
-            (r) =>
-                let
-                    nested = Record.FieldOrDefault(r, "Incidents", null),
-                    recs = ValueToRecords(nested),
-                    projected = List.Transform(
-                        recs,
-                        (rec) =>
-                            Record.FromList(
-                                List.Transform(Wanted, each SafeGet(rec, _)),
-                                Wanted
-                            )
-                    )
-                in
-                    projected
-        ),
+    Preview = Table.AddColumn(Sample, "IncidentsType", each GetTypeText([Incidents])),
+    Preview2 = Table.AddColumn(Preview, "HasPrice", each HasPrice([Incidents]))
+in
+    Preview2
 
-    // Flatten list-of-lists into single list and make a table
-    AllRecs = List.Combine(PerRowProjected),
-    Result = if List.Count(AllRecs) = 0 then Table.FromRecords({}, Wanted) else Table.FromRecords(AllRecs)
+
+
+//2
+
+let
+    Source = PreviousStep,
+
+    // Make an index so we can reference problem rows later
+    WithIndex = Table.AddIndexColumn(Source, "__OuterIndex", 0, 1, Int64.Type),
+
+    // Function: produce text preview of any nested value (table/record/list/null/error) without expanding
+    ValueToText = (v as any) as text =>
+        let s = try v otherwise null
+        in
+            if s = null then "null or error"
+            else if Value.Is(s, type table) then "table -> rows=" & Number.ToText(Table.RowCount(s)) & " cols=" & Text.Combine(Table.ColumnNames(s), ",")
+            else if Value.Is(s, type record) then "record -> fields=" & Text.Combine(Record.FieldNames(s), ",")
+            else if Value.Is(s, type list) then "list -> count=" & Number.ToText(List.Count(s))
+            else "primitive: " & Text.From(s),
+
+    // Detect rows that would error when accessing [Incidents][price] (try to access and capture errors)
+    Detect = Table.AddColumn(WithIndex, "TryPriceAccess", each try if Value.Is([Incidents], type table) then [Incidents]{0}[price] else if Value.Is([Incidents], type record) then Record.Field([Incidents], "price") else error "no price path" otherwise null),
+
+    // Mark rows where try returned an error (i.e., the rows that will blow up)
+    ErrorRows = Table.SelectRows(Detect, each try _[TryPriceAccess] otherwise <> null and (try _[TryPriceAccess] otherwise null) = null and (try Record.HasFields([Incidents], {"price"}) otherwise false) = false),
+
+    // Compose a compact debug preview for those rows
+    Debug = Table.TransformColumns(ErrorRows, {{"Incidents", each ValueToText(_), type text}}),
+    Result = Table.SelectColumns(Debug, {"__OuterIndex","Incidents"})
 in
     Result
+
+
+//3
+
+let
+    Source = PreviousStep,
+    WithIndex = Table.AddIndexColumn(Source, "__OuterIndex", 0, 1, Int64.Type),
+    idx = 0,  // replace 0 with one reported failing index from previous step
+    Row = try WithIndex{idx} otherwise null,
+    Nested = if Row = null then null else Row[Incidents],
+    Preview =
+        if Nested = null then "null or error"
+        else if Value.Is(Nested, type table) then
+            // return first 5 rows of nested table as records
+            Text.FromBinary( Text.ToBinary( Text.Combine( List.Transform( List.FirstN(Table.ToRecords(Nested),5), each Json.FromValue(_) ), "#(lf)" ) ) )
+        else if Value.Is(Nested, type record) then Text.FromBinary(Text.ToBinary(Json.FromValue(Nested)))
+        else if Value.Is(Nested, type list) then Text.FromBinary(Text.ToBinary(Json.FromValue(Nested)))
+        else Text.From(Nested)
+in
+    Preview
