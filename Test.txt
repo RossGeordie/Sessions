@@ -1,95 +1,70 @@
-// SafeExpand(inputTable, columnName, fieldList, optional normalizeToLower)
-// - inputTable: your outer table
-// - columnName: the nested column (e.g., "Incidents")
-// - fieldList: list of fields to extract (e.g., {"id","name","price"})
-// - normalizeToLower (optional): set to true to lower-case all nested field names before extraction
-// Returns: a single flat table with the requested fields; missing fields are null
-
 let
-    SafeExpand = (
-        inputTable as table,
-        columnName as text,
-        fieldList as list,
-        optional normalizeToLower as nullable logical
-    ) as table =>
-
+    SafeExtract = (inputTable as table, columnName as text, fieldList as list, optional normalizeToLower as nullable logical) as table =>
     let
-        // Normalize field names if requested
         LowerFlag = if normalizeToLower = null then false else normalizeToLower,
         TargetFields = if LowerFlag then List.Transform(fieldList, Text.Lower) else fieldList,
 
-        // Helper: lower-case all column names in a table
-        LowerTableCols = (t as table) as table => Table.TransformColumnNames(t, Text.Lower),
-
-        // Helper: extract only TargetFields from a record, missing -> null
-        ProjectRecord = (r as record) as record =>
-            List.Accumulate(
-                TargetFields,
-                [ ],
-                (state, f) =>
-                    let v = if Record.HasFields(r, {f}) then r[f] else null
-                    in Record.AddField(state, f, v)
-            ),
-
-        // Helper: convert any nested value into a table of projected records
-        // (tables with many rows -> many projected records; records -> single record; lists -> records if possible)
+        // Convert a single nested value to a table of projected records
         SafeTableFromValue = (v as any) as table =>
             let
-                safe =
-                    try
-                        if v = null then
-                            #table(TargetFields, {})
-                        else if Value.Is(v, type table) then
-                            let
-                                t = if LowerFlag then LowerTableCols(v) else v,
-                                recs = Table.ToRecords(t),
-                                projected = List.Transform(recs, ProjectRecord)
-                            in
-                                Table.FromRecords(projected)
-                        else if Value.Is(v, type record) then
-                            let
-                                r = if LowerFlag then Record.TransformFields(v, List.Transform(Record.FieldNames(v), each {_, (x)=>x, type any}), MissingField.Ignore) else v,
-                                projected = ProjectRecord(r)
-                            in
-                                Table.FromRecords({projected})
-                        else if Value.Is(v, type list) then
-                            let
-                                isRecList = List.Count(v) > 0 and List.AllTrue(List.Transform(v, each Value.Is(_, type record))),
-                                projected =
-                                    if isRecList then
-                                        let
-                                            recs = if LowerFlag then List.Transform(v, each _) else v,
-                                            mapped = List.Transform(recs, ProjectRecord)
-                                        in
-                                            Table.FromRecords(mapped)
-                                    else
-                                        // Non-record lists: put items into a single 'value' column only if requested, else empty
-                                        #table(TargetFields, {})
-                            in
-                                projected
-                        else
-                            #table(TargetFields, {})
-                    otherwise
-                        #table(TargetFields, {})
-            in
-                safe,
+                // guard errors and nulls
+                safeVal = try v otherwise null,
 
-        // Build a list of per-row tables by projecting only TargetFields
-        RowsAsRecords =
-            let
-                rows = Table.ToRecords(inputTable)
-            in
-                List.Transform(
-                    rows,
-                    (row) => SafeTableFromValue(Record.Field(row, columnName))
-                ),
+                // helper: lower-case table column names
+                LowerTableCols = (t as table) => Table.TransformColumnNames(t, Text.Lower),
 
-        // Combine all projected tables; missing fields are already null per record
-        Combined = Table.Combine(RowsAsRecords)
+                // project a record onto TargetFields (add missing as null)
+                ProjectRecord = (r as record) as record =>
+                    List.Accumulate(
+                        TargetFields,
+                        #table({},{}), // not used as accumulator initial; we'll build a record via Record.AddField below
+                        (state, f) =>
+                            let
+                                val = if Record.HasFields(r, {f}) then r[f] else null,
+                                next = if state = #table({}, {}) then Record.FromList({val}, {f}) else Record.AddField(state, f, val)
+                            in
+                                next
+                    ),
+
+                out =
+                    if safeVal = null then
+                        // empty table with correct columns but no rows
+                        Table.FromRecords({})
+                    else if Value.Is(safeVal, type table) then
+                        let t = if LowerFlag then LowerTableCols(safeVal) else safeVal,
+                            recs = Table.ToRecords(t),
+                            projected = List.Transform(recs, each ProjectRecord(_))
+                        in Table.FromRecords(projected)
+                    else if Value.Is(safeVal, type record) then
+                        let r = if LowerFlag then Record.TransformFields(safeVal, List.Transform(Record.FieldNames(safeVal), each {_, (x)=>x, type any}), MissingField.Ignore) else safeVal,
+                            projected = ProjectRecord(r)
+                        in Table.FromRecords({projected})
+                    else if Value.Is(safeVal, type list) then
+                        let
+                            isRecList = List.Count(safeVal) > 0 and List.AllTrue(List.Transform(safeVal, each Value.Is(_, type record))),
+                            projected =
+                                if isRecList then
+                                    let recs = if LowerFlag then List.Transform(safeVal, each _) else safeVal
+                                    in Table.FromRecords(List.Transform(recs, each ProjectRecord(_)))
+                                else
+                                    // non-record lists not supported for projection -> empty
+                                    Table.FromRecords({})
+                        in projected
+                    else
+                        Table.FromRecords({})
+            in
+                out,
+
+        // Build list of tables (one per outer row), preserving row order/context
+        Rows = Table.ToRecords(inputTable),
+        PerRowTables = List.Transform(Rows, each SafeTableFromValue(Record.Field(_, columnName))),
+
+        // If all PerRowTables are empty then Combined will be empty; this is expected if column is wrong
+        Combined = if List.IsEmpty(PerRowTables) then Table.FromRecords({}) else Table.Combine(List.Select(PerRowTables, each _ <> null))
     in
         Combined
 in
-    SafeExpand
+    SafeExtract
 
 
 //MAIN
@@ -100,3 +75,4 @@ let
     Result = SafeExpand(Source, "Incidents", {"id","name","created_at","updated_at","state","price"}, true)
 in
     Result
+
