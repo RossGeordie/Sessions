@@ -1,45 +1,81 @@
-// Drop-in function to normalize and expand a column of tables
-// Usage: NormalizeAndExpand(Source, "Incidents")
+// Ensures specified optional fields exist in every record inside a nested table column.
+// Missing fields are added as null, so expansion won't error.
+// Usage:
+//   Fixed = FixNestedOptionalFields(Source, "Incidents", {"id","name","created_at"}, {"price","assignee","priority"});
+//   // Then expand "Incidents" with the union of required+optional fields.
 
 let
-    NormalizeAndExpand = (inputTable as table, columnName as text) =>
+    FixNestedOptionalFields = (
+        inputTable as table,
+        columnName as text,
+        requiredFields as list,
+        optionalFields as list
+    ) as table =>
     let
-        // Step 1: make sure every nested table has consistent column casing
-        Lowered = Table.TransformColumns(inputTable, {columnName, each Table.TransformColumnNames(_, Text.Lower)}),
+        // Lower-case optional/required for consistent casing
+        req = List.Transform(requiredFields, Text.Lower),
+        opt = List.Transform(optionalFields, Text.Lower),
 
-        // Step 2: discover all possible columns across all nested tables
-        AllColumns =
-            let
-                namesPerTable = List.Transform(Lowered[columnName], each Table.ColumnNames(_)),
-                flattened     = List.Combine(namesPerTable),
-                distinctLower = List.Distinct(flattened)
-            in
-                distinctLower,
+        // 1) Guard against error/non-table cells in the nested column
+        Guarded =
+            Table.TransformColumns(
+                inputTable,
+                {
+                    columnName,
+                    each
+                        let v = try _ otherwise #table({}, {})
+                        in
+                            if Value.Is(v, type table) then v else #table({}, {})
+                }
+            ),
 
-        // Step 3: align each nested table to include all discovered columns
-        AlignSchema = (t as table) as table =>
+        // 2) Normalize casing inside each nested table and add missing optional fields to every record
+        NormalizeOneTable = (t as table) as table =>
             let
-                withAll =
-                    List.Accumulate(
-                        AllColumns,
-                        t,
-                        (state, col) =>
-                            if List.Contains(Table.ColumnNames(state), col) then state
-                            else Table.AddColumn(state, col, each null)
+                Lowered   = Table.TransformColumnNames(t, Text.Lower),
+                AsRecords = Table.ToRecords(Lowered),
+                PatchedRecords =
+                    List.Transform(
+                        AsRecords,
+                        (r) =>
+                            List.Accumulate(
+                                opt,
+                                r,
+                                (state, fld) =>
+                                    if Record.HasFields(state, {fld}) then state
+                                    else Record.AddField(state, fld, null)
+                            )
                     ),
-                reordered = Table.ReorderColumns(withAll, AllColumns, MissingField.Ignore)
+                BackToTable = Table.FromRecords(PatchedRecords)
             in
-                reordered,
+                BackToTable,
 
-        Normalised = Table.TransformColumns(Lowered, {columnName, AlignSchema}),
+        Normalized =
+            Table.TransformColumns(
+                Guarded,
+                { columnName, NormalizeOneTable }
+            ),
 
-        // Step 4: expand safely
-        Expanded = Table.ExpandTableColumn(Normalised, columnName, AllColumns)
+        // 3) Safe expansion: all required + optional fields now exist in every record
+        ExpandFields = List.Distinct(req & opt),
+        Expanded = Table.ExpandTableColumn(Normalized, columnName, ExpandFields)
     in
         Expanded
 in
-    NormalizeAndExpand
+    FixNestedOptionalFields
 
 
 
-Expanded = NormalizeAndExpand(Source, "Incidents")
+// Main
+
+let
+    // Your table with a single column "Incidents" (each cell is a nested table of incident records)
+    Source = PreviousStep,
+
+    // Choose fields (make price optional)
+    Required = {"id","name","created_at","updated_at","state"},
+    Optional = {"price","assignee","priority"},
+
+    Fixed = FixNestedOptionalFields(Source, "Incidents", Required, Optional)
+in
+    Fixed
