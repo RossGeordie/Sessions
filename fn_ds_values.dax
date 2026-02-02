@@ -1,0 +1,48 @@
+DEFINE
+	FUNCTION fn_ds_Values = (_measure: expr, _scale: numeric, _scope: numeric) =>
+		VAR _Edate =
+		DATE(SELECTEDVALUE(_dsYear[Year]), 12, 31)
+		VAR _Mdate =
+		SWITCH(
+			TRUE(),
+			HASONEVALUE('Calendar'[Year]), MAX('Calendar'[Date]),
+			BLANK()
+		)
+		VAR _Event =
+		LOOKUPVALUE(
+			TrackedEvents[LocationID],
+			TrackedEvents[Event Name],
+			SELECTEDVALUE(_dsEvents[Event])
+		)
+		VAR _LA = SELECTEDVALUE(_dsEvents[Authority])
+		VAR _EYear = SELECTEDVALUE(_dsYear[Year])
+		VAR _Eval =
+		SWITCH(
+			TRUE(),
+			_scale = 1 && _scope = 1, CALCULATE(
+				_measure,
+				TrackedEvents[LocationID] = _Event,
+				'Calendar'[Year] = _EYear
+			),
+			_scale = 1 && _scope = 2, SWITCH(
+				TRUE(),
+				ISBLANK(_Mdate), CALCULATE(
+					_measure,
+					TrackedEvents[LocationID] = _Event,
+					'Calendar'[Date] <= _Edate
+				),
+				_Edate >= _Mdate, CALCULATE(
+					_measure,
+					TrackedEvents[LocationID] = _Event
+				),
+				BLANK()
+			),
+			_scale = 2 && _scope = 1, CALCULATE(
+				_measure,
+				TrackedEvents[Local Authority] = _LA,
+				'Calendar'[Year] = _EYear
+			),
+			BLANK()
+		)
+		RETURN
+			_Eval
