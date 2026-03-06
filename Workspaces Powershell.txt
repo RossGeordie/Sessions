@@ -1,0 +1,196 @@
+<#
+Batch-unassign Power BI/Fabric workspaces from capacity using Admin API
+Endpoint: POST https://api.powerbi.com/v1.0/myorg/admin/capacities/UnassignWorkspaces
+Body: { "workspacesToUnassign": [ "guid1", "guid2", ... ] }
+Source: Microsoft Learn (Power BI REST Admin) [1](https://learn.microsoft.com/en-us/rest/api/power-bi/admin/capacities-unassign-workspaces-from-capacity)
+#>
+
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$TenantId,
+
+    # Use either (ClientId + ClientSecret) OR Interactive login.
+    [string]$ClientId,
+    [string]$ClientSecret,
+
+    # CSV with a column named workspaceId
+    [string]$CsvPath = ".\workspaces.csv",
+
+    # How many workspaces to send per request
+    [int]$BatchSize = 200,
+
+    # Output log
+    [string]$LogPath = ".\unassign-log.jsonl"
+)
+
+$ErrorActionPreference = "Stop"
+
+function Write-JsonLine {
+    param([object]$obj, [string]$path)
+    $obj | ConvertTo-Json -Depth 10 -Compress | Add-Content -Path $path
+}
+
+function Get-AccessToken {
+    param(
+        [string]$TenantId,
+        [string]$ClientId,
+        [string]$ClientSecret
+    )
+
+    # OAuth2 client_credentials flow for Power BI resource
+    # resource/scope for Power BI REST API is https://analysis.windows.net/powerbi/api/.default
+    $tokenEndpoint = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+    $body = @{
+        client_id     = $ClientId
+        client_secret = $ClientSecret
+        grant_type    = "client_credentials"
+        scope         = "https://analysis.windows.net/powerbi/api/.default"
+    }
+
+    $resp = Invoke-RestMethod -Method Post -Uri $tokenEndpoint -Body $body -ContentType "application/x-www-form-urlencoded"
+    return $resp.access_token
+}
+
+function Invoke-UnassignBatch {
+    param(
+        [string]$AccessToken,
+        [string[]]$WorkspaceIds
+    )
+
+    $uri = "https://api.powerbi.com/v1.0/myorg/admin/capacities/UnassignWorkspaces" # [1](https://learn.microsoft.com/en-us/rest/api/power-bi/admin/capacities-unassign-workspaces-from-capacity)
+    $payload = @{
+        workspacesToUnassign = $WorkspaceIds
+    } | ConvertTo-Json -Depth 5
+
+    $headers = @{
+        Authorization = "Bearer $AccessToken"
+        "Content-Type" = "application/json"
+    }
+
+    # Retry loop (handles throttling)
+    $maxAttempts = 8
+    $attempt = 0
+    while ($true) {
+        $attempt++
+
+        try {
+            $resp = Invoke-WebRequest -Method Post -Uri $uri -Headers $headers -Body $payload
+            return @{
+                StatusCode = [int]$resp.StatusCode
+                Content    = $resp.Content
+                Headers    = $resp.Headers
+            }
+        }
+        catch {
+            $ex = $_.Exception
+
+            # If we have an HTTP response, we can inspect it
+            if ($ex.Response -and $ex.Response.StatusCode) {
+                $statusCode = [int]$ex.Response.StatusCode
+                $retryAfter = $null
+
+                try {
+                    $retryAfter = $ex.Response.Headers["Retry-After"]
+                } catch {}
+
+                if ($statusCode -eq 429 -and $attempt -lt $maxAttempts) {
+                    # Fabric Core docs explicitly mention 429 + Retry-After header for throttling [2](https://learn.microsoft.com/en-us/rest/api/fabric/core/workspaces/unassign-from-capacity)
+                    $sleepSeconds = 30
+                    if ($retryAfter) {
+                        [int]::TryParse($retryAfter.ToString(), [ref]$sleepSeconds) | Out-Null
+                    }
+                    Write-Host "Throttled (429). Sleeping $sleepSeconds seconds then retrying (attempt $attempt/$maxAttempts)..."
+                    Start-Sleep -Seconds $sleepSeconds
+                    continue
+                }
+            }
+
+            throw
+        }
+    }
+}
+
+# --- Main ---
+
+if (-not (Test-Path $LogPath)) {
+    New-Item -ItemType File -Path $LogPath -Force | Out-Null
+}
+
+# Load workspace IDs
+$workspaceIds = @()
+
+if ($CsvPath -and (Test-Path $CsvPath)) {
+    $workspaceIds = (Import-Csv $CsvPath).workspaceId | Where-Object { $_ -and $_.Trim() -ne "" } | ForEach-Object { $_.Trim() }
+} else {
+    throw "CSV path not found: $CsvPath"
+}
+
+if ($workspaceIds.Count -eq 0) {
+    throw "No workspace IDs found in $CsvPath"
+}
+
+# Validate GUID format (soft validation)
+$validIds = @()
+$invalidIds = @()
+foreach ($id in $workspaceIds) {
+    $g = [Guid]::Empty
+    if ([Guid]::TryParse($id, [ref]$g)) { $validIds += $id } else { $invalidIds += $id }
+}
+
+if ($invalidIds.Count -gt 0) {
+    Write-Host "WARNING: $($invalidIds.Count) invalid GUID(s) will be skipped."
+    Write-JsonLine @{ type="invalidIds"; ids=$invalidIds; timestamp=(Get-Date).ToString("o") } $LogPath
+}
+
+$workspaceIds = $validIds
+Write-Host "Loaded $($workspaceIds.Count) valid workspace IDs."
+
+# Get access token
+if (-not $ClientId -or -not $ClientSecret) {
+    throw "Provide -ClientId and -ClientSecret for service principal auth."
+}
+$token = Get-AccessToken -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
+
+# Batch loop
+$total = $workspaceIds.Count
+$batchCount = [Math]::Ceiling($total / $BatchSize)
+
+for ($b = 0; $b -lt $batchCount; $b++) {
+    $start = $b * $BatchSize
+    $end = [Math]::Min($start + $BatchSize - 1, $total - 1)
+    $batch = $workspaceIds[$start..$end]
+
+    Write-Host "Submitting batch $($b+1)/$batchCount: $($batch.Count) workspace(s)..."
+
+    try {
+        $result = Invoke-UnassignBatch -AccessToken $token -WorkspaceIds $batch
+
+        Write-JsonLine @{
+            type       = "batchResult"
+            batchIndex = $b + 1
+            count      = $batch.Count
+            statusCode = $result.StatusCode
+            response   = $result.Content
+            timestamp  = (Get-Date).ToString("o")
+        } $LogPath
+
+        Write-Host "Batch $($b+1) completed. Status: $($result.StatusCode)"
+    }
+    catch {
+        Write-Host "Batch $($b+1) FAILED: $($_.Exception.Message)" -ForegroundColor Red
+
+        Write-JsonLine @{
+            type       = "batchError"
+            batchIndex = $b + 1
+            count      = $batch.Count
+            error      = $_.Exception.Message
+            timestamp  = (Get-Date).ToString("o")
+            workspaces = $batch
+        } $LogPath
+
+        # Continue with next batch (or change to `throw` if you want to stop on first failure)
+        continue
+    }
+}
+
+Write-Host "Done. Log written to $LogPath"
